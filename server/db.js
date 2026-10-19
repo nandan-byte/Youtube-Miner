@@ -1,4 +1,11 @@
-const Database = require('better-sqlite3');
+let Database;
+try {
+  Database = require('better-sqlite3');
+} catch (e) {
+  console.error('[FATAL] Failed to load better-sqlite3 native addon:', e);
+  throw e;
+}
+
 const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
@@ -10,7 +17,14 @@ if (!fs.existsSync(dataDir)) {
 }
 
 const dbPath = path.join(dataDir, 'youtube_qa.db');
-const db = new Database(dbPath);
+let db;
+try {
+  db = new Database(dbPath);
+  console.log(`[DB] Successfully opened SQLite database at: ${dbPath}`);
+} catch (e) {
+  console.error(`[FATAL] Failed to open SQLite database at ${dbPath}:`, e);
+  throw e;
+}
 
 // Enable WAL mode or fallback to DELETE mode if filesystem does not support shared memory WAL
 try {
