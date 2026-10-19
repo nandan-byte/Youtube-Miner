@@ -1,4 +1,13 @@
 require('dotenv').config();
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
@@ -23,6 +32,10 @@ initDatabase();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Health check endpoint for cloud platforms (Railway, Render, etc.)
+app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/api/health', (req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
 
 // Middleware
 app.use(express.json());
@@ -395,8 +408,8 @@ if (fs.existsSync(clientDistPath)) {
   });
 }
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`[Server] YouTube Playback Testing Server running on http://localhost:${PORT}`);
+// Start Server (Bind to 0.0.0.0 for Docker & Cloud PaaS routing)
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Server] YouTube Playback Testing Server running on http://0.0.0.0:${PORT}`);
   console.log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
 });

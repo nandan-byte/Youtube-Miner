@@ -12,9 +12,17 @@ if (!fs.existsSync(dataDir)) {
 const dbPath = path.join(dataDir, 'youtube_qa.db');
 const db = new Database(dbPath);
 
-// Enable WAL mode and foreign keys for high reliability and performance
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// Enable WAL mode or fallback to DELETE mode if filesystem does not support shared memory WAL
+try {
+  db.pragma('journal_mode = WAL');
+} catch (err) {
+  console.warn('[DB] WAL mode not supported on this filesystem, falling back to standard journal:', err.message);
+  try { db.pragma('journal_mode = DELETE'); } catch (e) {}
+}
+
+try {
+  db.pragma('foreign_keys = ON');
+} catch (e) {}
 
 function initDatabase() {
   // 1. Users table
