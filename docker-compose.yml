@@ -1,0 +1,20 @@
+services:
+  youtube-miner:
+    build: .
+    container_name: youtube-miner
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - SESSION_SECRET=change_this_to_a_random_secure_secret
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=ChangeThisPassword123!
+      - GROK_API_KEY=
+      - GROK_API_BASE=https://api.groq.com/openai/v1
+      - GROK_MODEL=openai/gpt-oss-120b
+      - HEADLESS_DEFAULT=true
+      - MAX_REPETITIONS=100
+      - MAX_DURATION_SECONDS=14400
+    volumes:
+      - ./data:/app/data

@@ -1,0 +1,10 @@
+node_modules
+client/node_modules
+client/dist
+.git
+.env
+.env.local
+data/*.db*
+*.bat
+*.ps1
+README.md
