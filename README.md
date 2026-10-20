@@ -24,10 +24,11 @@ Operate everything through the browser GUI—no terminal commands, manual browse
   - Real-time Server-Sent Events (SSE) telemetry console with live player metrics (currentTime, readyState, paused/buffering state) and auto-scrolling log stream.
   - Comprehensive SQLite test history with individual repetition audit logs and one-click history clearing.
 - **Playwright Chromium Automation Engine**:
-  - Opens target video in a dedicated, isolated browser session.
-  - Automatically handles and dismisses YouTube cookie/consent dialogs.
+  - High-performance parallel multi-stream testing with up to 10 concurrent streams.
+  - Resource-optimized shared browser architecture with isolated `BrowserContext` sessions (Docker & Railway cloud container ready).
+  - Automatically handles and dismisses YouTube cookie/consent dialogs and skips ads.
   - Detects error screens ("Video unavailable", private, removed, region-locked).
-  - Unmutes and triggers HTML5 video playback.
+  - Unmutes and triggers HTML5 video playback with full-video and custom duration modes.
   - Verifies that playback begins (`currentTime > 0` and `!paused`).
   - Observes continuous playback for configured duration.
   - Logs interruptions, stalls, and playback anomalies.
