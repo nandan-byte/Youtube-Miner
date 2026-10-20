@@ -27,7 +27,7 @@ class PlaybackRunner extends EventEmitter {
       status: this.activeJob.status,
       elapsedSeconds: this.activeJob.elapsedSeconds || 0,
       totalVideoDuration: this.activeJob.totalVideoDuration || 0,
-      activeStreamsCount: this.activeJob.activeBrowsers ? this.activeJob.activeBrowsers.size : 0,
+      activeStreamsCount: this.activeJob.activeContexts ? this.activeJob.activeContexts.size : 0,
       logs: this.activeJob.logs ? this.activeJob.logs.slice(-30) : []
     };
   }
@@ -37,19 +37,26 @@ class PlaybackRunner extends EventEmitter {
       return { success: false, message: 'No active playback test is running.' };
     }
 
-    const { runId, activeBrowsers } = this.activeJob;
+    const { runId, activeContexts, sharedBrowser } = this.activeJob;
     this.activeJob.isAborted = true;
     this.activeJob.status = 'stopping';
 
     this.emitLog(runId, null, 'Cancellation requested by user. Terminating all active parallel browser sessions...', 'warn');
 
-    if (activeBrowsers) {
-      for (const b of activeBrowsers) {
+    if (activeContexts) {
+      for (const ctx of activeContexts) {
         try {
-          await b.close().catch(() => {});
+          await ctx.close().catch(() => {});
         } catch (e) {}
       }
-      activeBrowsers.clear();
+      activeContexts.clear();
+    }
+
+    if (sharedBrowser) {
+      try {
+        await sharedBrowser.close().catch(() => {});
+      } catch (e) {}
+      this.activeJob.sharedBrowser = null;
     }
 
     const now = new Date().toISOString();
@@ -133,7 +140,8 @@ class PlaybackRunner extends EventEmitter {
       elapsedSeconds: 0,
       totalVideoDuration: 0,
       logs: [],
-      activeBrowsers: new Set()
+      activeContexts: new Set(),
+      sharedBrowser: null
     };
 
     this.emit('test_started', {
@@ -152,6 +160,41 @@ class PlaybackRunner extends EventEmitter {
     });
 
     return { success: true, runId };
+  }
+
+  async getSharedBrowser(job) {
+    if (job.sharedBrowser && job.sharedBrowser.isConnected()) {
+      return job.sharedBrowser;
+    }
+
+    const isNoDisplayLinux = process.platform === 'linux' && !process.env.DISPLAY;
+    const effectiveHeadless = isNoDisplayLinux ? true : Boolean(job.headless);
+
+    this.emitLog(
+      job.runId,
+      null,
+      `Initializing shared Chromium engine (Headless: ${effectiveHeadless ? 'YES' : 'NO'}${isNoDisplayLinux && !job.headless ? ' - cloud container' : ''})...`
+    );
+
+    const browser = await chromium.launch({
+      headless: effectiveHeadless,
+      args: [
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--mute-audio',
+        '--window-size=1280,720'
+      ]
+    });
+
+    job.sharedBrowser = browser;
+    return browser;
   }
 
   async runJobLoop(runId) {
@@ -176,8 +219,30 @@ class PlaybackRunner extends EventEmitter {
       'info'
     );
 
+    try {
+      await this.getSharedBrowser(job);
+    } catch (launchErr) {
+      this.emitLog(runId, null, `Failed to launch Chromium engine: ${launchErr.message}`, 'error');
+      db.prepare(`UPDATE test_runs SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`)
+        .run(launchErr.message, new Date().toISOString(), runId);
+      this.emit('test_completed', {
+        runId,
+        status: 'failed',
+        successCount: 0,
+        failureCount: job.targetRepetitions,
+        totalRepetitions: job.targetRepetitions
+      });
+      this.activeJob = null;
+      return;
+    }
+
     // Worker definition: pulls next repetition from queue when ready
     const runWorker = async (workerId) => {
+      // Stagger worker start to eliminate instant CPU and RAM spikes on container launch
+      if (workerId > 1) {
+        await new Promise(r => setTimeout(r, (workerId - 1) * 500));
+      }
+
       while (queue.length > 0 && !job.isAborted) {
         const rep = queue.shift();
         if (!rep) break;
@@ -198,21 +263,52 @@ class PlaybackRunner extends EventEmitter {
           repetitionIndex: rep,
           totalRepetitions: job.targetRepetitions,
           workerId,
-          activeStreamsCount: job.activeBrowsers ? job.activeBrowsers.size + 1 : 1,
+          activeStreamsCount: job.activeContexts ? job.activeContexts.size + 1 : 1,
           playFullVideo: job.playFullVideo
         });
 
         this.emitLog(runId, rep, `[Stream ${workerId}] Launched parallel session for Repetition ${rep} of ${job.targetRepetitions}...`);
 
         let repResult = null;
-        try {
-          repResult = await this.executeSingleRepetition(job, rep, workerId);
-        } catch (err) {
-          repResult = {
-            success: false,
-            achievedDuration: 0,
-            error: err.message || 'Unknown automation error'
-          };
+        let attempts = 0;
+        while (attempts < 2 && !job.isAborted) {
+          attempts++;
+          try {
+            repResult = await this.executeSingleRepetition(job, rep, workerId);
+            if (repResult.success) break;
+
+            const isCrash = repResult.error && (
+              repResult.error.toLowerCase().includes('crash') ||
+              repResult.error.toLowerCase().includes('closed') ||
+              repResult.error.toLowerCase().includes('destroyed')
+            );
+
+            if (isCrash && attempts < 2 && !job.isAborted) {
+              this.emitLog(runId, rep, `[Stream ${workerId}] Detected transient container glitch (${repResult.error}). Auto-recovering session (retry 2/2)...`, 'warn');
+              await new Promise(r => setTimeout(r, 1200));
+              continue;
+            }
+            break;
+          } catch (err) {
+            const isCrash = err.message && (
+              err.message.toLowerCase().includes('crash') ||
+              err.message.toLowerCase().includes('closed') ||
+              err.message.toLowerCase().includes('destroyed')
+            );
+
+            if (isCrash && attempts < 2 && !job.isAborted) {
+              this.emitLog(runId, rep, `[Stream ${workerId}] Transient error caught. Retrying repetition ${rep}...`, 'warn');
+              await new Promise(r => setTimeout(r, 1200));
+              continue;
+            }
+
+            repResult = {
+              success: false,
+              achievedDuration: 0,
+              error: err.message || 'Unknown automation error'
+            };
+            break;
+          }
         }
 
         if (job.isAborted) break;
@@ -268,6 +364,14 @@ class PlaybackRunner extends EventEmitter {
       Array.from({ length: workerCount }, (_, i) => runWorker(i + 1))
     );
 
+    // Clean up shared browser
+    if (job.sharedBrowser) {
+      try {
+        await job.sharedBrowser.close().catch(() => {});
+      } catch (e) {}
+      job.sharedBrowser = null;
+    }
+
     if (job.isAborted) {
       this.emitLog(runId, null, 'Playback test execution aborted by user.', 'warn');
       return;
@@ -301,45 +405,46 @@ class PlaybackRunner extends EventEmitter {
   }
 
   async executeSingleRepetition(job, rep, workerId) {
-    let browser = null;
+    let context = null;
+    let page = null;
     let achievedDuration = 0;
 
     try {
-      // Check if running in a headless environment (e.g. Linux container/VPS without X11 DISPLAY)
-      const isNoDisplayLinux = process.platform === 'linux' && !process.env.DISPLAY;
-      const effectiveHeadless = isNoDisplayLinux ? true : Boolean(job.headless);
+      const browser = await this.getSharedBrowser(job);
 
-      this.emitLog(job.runId, rep, `[Stream ${workerId}] Launching Chromium (Headless: ${effectiveHeadless ? 'YES' : 'NO'}${isNoDisplayLinux && !job.headless ? ' - forced headless by cloud host' : ''})...`);
-
-      browser = await chromium.launch({
-        headless: effectiveHeadless,
-        args: [
-          '--autoplay-policy=no-user-gesture-required',
-          '--disable-blink-features=AutomationControlled',
-          '--disable-infobars',
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--window-size=1280,800'
-        ]
-      });
-
-      if (job.activeBrowsers) {
-        job.activeBrowsers.add(browser);
-      }
-
-      if (job.isAborted) {
-        if (job.activeBrowsers) job.activeBrowsers.delete(browser);
-        await browser.close().catch(() => {});
-        return { success: false, achievedDuration: 0, error: 'Cancelled' };
-      }
-
-      const context = await browser.newContext({
+      context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         locale: 'en-US'
       });
 
-      const page = await context.newPage();
+      if (job.activeContexts) {
+        job.activeContexts.add(context);
+      }
+
+      if (job.isAborted) {
+        if (job.activeContexts) job.activeContexts.delete(context);
+        await context.close().catch(() => {});
+        return { success: false, achievedDuration: 0, error: 'Cancelled' };
+      }
+
+      page = await context.newPage();
+
+      // Intercept and abort heavy non-essential assets to keep memory minimal on Docker/Railway
+      await page.route('**/*', (route) => {
+        const req = route.request();
+        const type = req.resourceType();
+        const url = req.url();
+        if (
+          type === 'image' ||
+          type === 'font' ||
+          url.includes('google-analytics.com') ||
+          url.includes('doubleclick.net')
+        ) {
+          return route.abort();
+        }
+        return route.continue();
+      });
 
       this.emitLog(job.runId, rep, `[Stream ${workerId}] Navigating to video...`);
       await page.goto(job.videoUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
@@ -452,7 +557,7 @@ class PlaybackRunner extends EventEmitter {
           paused: state.paused,
           isAdShowing: state.isAdShowing,
           readyState: state.readyState,
-          activeStreamsCount: job.activeBrowsers ? job.activeBrowsers.size : 1
+          activeStreamsCount: job.activeContexts ? job.activeContexts.size : 1
         });
 
         if (job.playFullVideo) {
@@ -485,8 +590,10 @@ class PlaybackRunner extends EventEmitter {
         await page.waitForTimeout(1000);
       }
 
-      if (job.activeBrowsers) job.activeBrowsers.delete(browser);
-      await browser.close().catch(() => {});
+      if (context) {
+        if (job.activeContexts) job.activeContexts.delete(context);
+        await context.close().catch(() => {});
+      }
 
       return {
         success: true,
@@ -494,9 +601,9 @@ class PlaybackRunner extends EventEmitter {
       };
 
     } catch (err) {
-      if (browser) {
-        if (job.activeBrowsers) job.activeBrowsers.delete(browser);
-        await browser.close().catch(() => {});
+      if (context) {
+        if (job.activeContexts) job.activeContexts.delete(context);
+        await context.close().catch(() => {});
       }
       return {
         success: false,
